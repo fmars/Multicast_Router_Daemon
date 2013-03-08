@@ -1,0 +1,150 @@
+#include "defs.h"
+u_long virtual_time = 0;
+int mysignal=0;
+#define NHANDLERS       3
+
+static struct ihandler 
+{
+    int fd;			/* File descriptor               */
+    ihfunc_t func;		/* Function to call with &fd_set */
+} ihandlers[NHANDLERS];//句柄结构，注册报文输入函数用
+static int nhandlers = 0;
+
+void handler(int sig)
+{
+    switch(sig)
+    {
+    	case SIGINT://ctrl+c
+    	case SIGTERM://终止进程     软件终止信号
+	     mysignal=1; //exit
+	     break;
+    }
+}
+void timer()
+{//如果没有计时器事件，默认5秒循环依次，设置5秒的计时器
+    virtual_time += 5;
+    timer_setTimer(5, timer, NULL);
+}
+int register_input_handler(int fd,ihfunc_t func)
+{//注册报文输入处理函数
+    if (nhandlers >= NHANDLERS)
+	return -1;
+    
+    ihandlers[nhandlers].fd = fd;
+    ihandlers[nhandlers++].func = func;
+    
+    return 0;
+}
+
+int main(int argc,char *argv[])
+{	
+		struct timeval tv, difftime, curtime, lasttime, *timeout;
+		fd_set rfds, readers;
+		int nfds, n, i, secs;
+
+		struct sigaction sa;
+    
+
+		setlinebuf(stderr);	
+    if (geteuid()!= 0) 
+    {
+				log(LOG_INFO,"Error:Pogram must be run on root!\n");
+				exit(1);
+		}
+
+    
+    log(LOG_INFO,"PIM DM Daemon starting");
+    
+    srandom(gethostid());//随机数
+
+    callout_init();
+    init_igmp();
+    init_pim();
+    init_route();
+    init_mrt();
+    init_vifs();//初始化
+
+    sa.sa_handler = handler;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,&sa,NULL);
+    sigaction(SIGTERM,&sa,NULL);
+    
+    FD_ZERO(&readers);
+    FD_SET(igmpsocket, &readers);
+    nfds=igmpsocket+1;
+    for (i=0;i<nhandlers; i++) 
+    {
+			FD_SET(ihandlers[i].fd,&readers);
+			if (ihandlers[i].fd >= nfds)
+					nfds = ihandlers[i].fd + 1;
+    }//字符集操作的设置
+    
+    timer_setTimer(5, timer, NULL);//开始第一个计时器
+    
+    difftime.tv_usec = 0;
+    gettimeofday(&curtime, NULL);
+    lasttime = curtime;//difftime、lasttime是用来计算处理报文或计时器事件用到的时间，如果超过1秒，要检查是否影响下一个计时器事件
+    while(1)
+    {	//开始循环
+			//print_sg();
+				bcopy((char *)&readers, (char *)&rfds, sizeof(rfds));
+				secs = timer_nextTimer();
+				if (secs ==-1)
+						timeout = NULL;
+				else 
+        {
+						timeout = &tv;
+						timeout->tv_sec = secs;
+						timeout->tv_usec = 0;
+        }
+        if(mysignal==1) 
+				{
+						break;//是否有退出信号，ctrl+c
+				}
+				if ((n = select(nfds, &rfds, NULL, NULL, timeout)) < 0) 
+        {
+						continue;//监听是否有报文
+				}
+				do 
+				{
+						if (n == 0) 
+						{
+								curtime.tv_sec = lasttime.tv_sec + secs;
+								curtime.tv_usec = lasttime.tv_usec;
+								n = -1;	
+						} 
+						else
+								gettimeofday(&curtime, NULL);
+						difftime.tv_sec = curtime.tv_sec - lasttime.tv_sec;
+						difftime.tv_usec += curtime.tv_usec - lasttime.tv_usec;
+						while (difftime.tv_usec > 1000000) 
+						{
+								difftime.tv_sec++;
+								difftime.tv_usec -= 1000000;
+						}
+						if (difftime.tv_usec < 0) 
+            {
+								difftime.tv_sec--;
+								difftime.tv_usec += 1000000;
+						}
+						lasttime = curtime;
+						if (secs == 0 || difftime.tv_sec > 0) {
+								age_callout_queue(difftime.tv_sec);
+						}
+						secs = -1;
+				} while (difftime.tv_sec > 0);
+				if (n > 0) 
+				{
+						for (i = 0; i < nhandlers; i++) 
+						{
+								if (FD_ISSET(ihandlers[i].fd, &rfds)) 
+								{
+										(*ihandlers[i].func)(ihandlers[i].fd, &rfds);
+								}
+						}//监听计时器
+				}
+		}
+		log(LOG_INFO,"Program exiting");
+		exit(0);
+}
